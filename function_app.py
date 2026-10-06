@@ -292,7 +292,7 @@ def extract_chamado_status_historico(myTimer: func.TimerRequest) -> None:
     run_on_startup=False,
     use_monitor=False
 )
-def extract_cliente_avaliacao(myTimer: func.TimerRequest) -> None:
+def extract_cliente_organizacao(myTimer: func.TimerRequest) -> None:
 
     # Variáveis de ambiente
     host_sql = os.getenv("HOST")
@@ -323,14 +323,14 @@ def extract_cliente_avaliacao(myTimer: func.TimerRequest) -> None:
             # Capturar os dados da tabela chamado
             cursor.execute("""
                 SELECT *
-                FROM itsm.cliente_avaliacao
+                FROM itsm.cliente_organizacao
             """)
 
             registros = cursor.fetchall()
 
             logging.info(
                 f"Foram encontrados {len(registros)} registros "
-                f"na tabela itsm.cliente_avaliacao."
+                f"na tabela itsm.cliente_organizacao."
             )
 
             # Exibir os dados capturados
@@ -348,7 +348,7 @@ def extract_cliente_avaliacao(myTimer: func.TimerRequest) -> None:
     run_on_startup=False,
     use_monitor=False
 )
-def extract_csat_organizacao(myTimer: func.TimerRequest) -> None:
+def extract_csat_avaliacao(myTimer: func.TimerRequest) -> None:
 
     # Variáveis de ambiente
     host_sql = os.getenv("HOST")
@@ -379,14 +379,14 @@ def extract_csat_organizacao(myTimer: func.TimerRequest) -> None:
             # Capturar os dados da tabela chamado
             cursor.execute("""
                 SELECT *
-                FROM itsm.csat_organizacao
+                FROM itsm.csat_avaliacao
             """)
 
             registros = cursor.fetchall()
 
             logging.info(
                 f"Foram encontrados {len(registros)} registros "
-                f"na tabela itsm.csat_organizacao."
+                f"na tabela itsm.csat_avaliacao."
             )
 
             # Exibir os dados capturados
