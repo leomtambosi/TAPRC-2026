@@ -1,69 +1,52 @@
-
-name: CI/CD Azure Functions
+name: CI/CD
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
+    branches: ["main"]
 
 jobs:
   validar:
-    name: Validar código Python
     runs-on: ubuntu-latest
-
     steps:
-      - name: Baixar código do repositório
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - run: python3 --version
+      - run: python3 -m py_compile function_app.py
 
-      - name: Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
+      # Instalação das dependências de validação (ruff, black e isort)
+      - name: Instalar ferramentas de lint e formatação
+        run: pip install ruff black isort
 
-      - name: Verificar versão do Python
-        run: python --version
+      # 1. VERIFICAÇÃO DE IMPORTS: isort
+      - name: Verificação de imports (isort)
+        run: isort --check-only --profile black .
 
-      - name: Validar sintaxe Python
-        run: python -m py_compile function_app.py
+      # 2. FORMATAÇÃO AUTOMÁTICA: black
+      - name: Formatação automática (Black)
+        run: black --check .
+
+      # 3. LINTING: ruff
+      - name: Linting e padrões PEP8 (Ruff)
+        run: ruff check .
 
   deploy:
-    name: Deploy Azure Functions
     needs: validar
     runs-on: ubuntu-latest
-
     permissions:
       id-token: write
       contents: read
-
     env:
-      AZURE_FUNCTIONAPP_NAME: funcapp-leonardo0001
-
+      AZURE_FUNCTIONAPP_NAME: 'funcapp-leonardo0001'
     steps:
-      - name: Baixar código do repositório
-        uses: actions/checkout@v4
-
-      - name: Configurar Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-
-      - name: Instalar dependências
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-
-      - name: Autenticar no Azure
-        uses: azure/login@v2
+      - uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Publicar Azure Function
-        uses: Azure/functions-action@v1
+      - uses: Azure/functions-action@v1
         with:
           app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
           package: .
