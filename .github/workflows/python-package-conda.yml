@@ -1,38 +1,69 @@
-name: CI/CD
+
+name: CI/CD Azure Functions
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   validar:
+    name: Validar código Python
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - run: python3 --version
-      - run: python3 -m py_compile function_app.py
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
 
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
 
+      - name: Verificar versão do Python
+        run: python --version
+
+      - name: Validar sintaxe Python
+        run: python -m py_compile function_app.py
 
   deploy:
+    name: Deploy Azure Functions
     needs: validar
     runs-on: ubuntu-latest
+
     permissions:
       id-token: write
       contents: read
+
     env:
-      AZURE_FUNCTIONAPP_NAME: 'funcapp-leonardo0001'
+      AZURE_FUNCTIONAPP_NAME: funcapp-leonardo0001
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - uses: azure/login@v2
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Autenticar no Azure
+        uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - uses: Azure/functions-action@v1
+
+      - name: Publicar Azure Function
+        uses: Azure/functions-action@v1
         with:
           app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
           package: .
