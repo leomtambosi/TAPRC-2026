@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime
+from datetime import timezone
 
 import azure.functions as func
 import pyodbc
@@ -29,7 +30,7 @@ def salvar_na_camada_bronze(tabela: str, registros: list, colunas: list) -> None
         fonte, entidade = tabela.split(".")
 
         # Momento atual em UTC para estruturação das pastas e do arquivo
-        agora = datetime.utcnow()
+        agora = datetime.now(timezone.utc)
         ano = agora.strftime("%Y")
         mes = agora.strftime("%m")
         dia = agora.strftime("%d")
