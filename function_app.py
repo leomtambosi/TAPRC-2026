@@ -1,8 +1,7 @@
 import json
 import logging
 import os
-from datetime import datetime
-from datetime import timezone
+from datetime import datetime, timezone
 
 import azure.functions as func
 import pyodbc
