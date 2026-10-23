@@ -1,0 +1,12 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "DefaultEndpointsProtocol=https;AccountName=seu_account;AccountKey=sua_chave_ficticia;",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "HOST": "seu_servidor_sql",
+    "DATABASE": "seu_banco",
+    "USER": "seu_usuario",
+    "PASSWORD": "sua_senha",
+    "DEPLOYMENT_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=seu_account;AccountKey=sua_chave_ficticia;"
+  }
+}
