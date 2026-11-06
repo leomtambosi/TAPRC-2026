@@ -5,8 +5,10 @@
     "FUNCTIONS_WORKER_RUNTIME": "python",
     "HOST": "seu_servidor_sql",
     "DATABASE": "seu_banco",
+    "SOURCE_NAME": "itsm",
     "USER": "seu_usuario",
     "PASSWORD": "sua_senha",
     "DEPLOYMENT_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=seu_account;AccountKey=sua_chave_ficticia;"
   }
 }
+
