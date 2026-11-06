@@ -1,7 +1,9 @@
-azure-functions
 azure-storage-blob
 pandas
 pyarrow
 fastparquet
 sqlalchemy
 pyodbc
+azure-functions
+azure-storage-file-datalake
+azure-core
