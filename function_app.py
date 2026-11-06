@@ -377,7 +377,7 @@ def load_all_bronze_to_sql(myTimer: func.TimerRequest) -> None:
         "csat",
         "csat_avaliacao",
     ]
-
+    
     logger.info(
         "A iniciar o carregamento em massa do Data Lake para o SQL (somente arquivos de hoje)..."
     )
