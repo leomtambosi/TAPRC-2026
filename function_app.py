@@ -1,286 +1,400 @@
-import json
+import csv
+import io
 import logging
 import os
-from datetime import datetime
-from typing import Any
+from datetime import UTC, date, datetime, time
 
 import azure.functions as func
 import pyodbc
-from azure.storage.blob import BlobServiceClient, ContainerClient
+from azure.core.exceptions import AzureError, ResourceNotFoundError
+from azure.storage.filedatalake import DataLakeServiceClient
 
 app = func.FunctionApp()
 logger = logging.getLogger(__name__)
 
-# Ordem de carga pensada para respeitar chaves estrangeiras (Foreign Keys)
-ORDEM_ENTIDADES = [
-    "cliente_organizacao",
-    "solicitante",
-    "analista",
-    "categoria",
-    "fila",
-    "sla",
-    "chamado",
-    "chamado_sla",
-    "chamado_status_historico",
-    "csat_avaliacao",
-]
+
+def _table_metadata(cursor, schema: str, table_name: str):
+    cursor.execute(
+        "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE "
+        "FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+        schema,
+        table_name,
+    )
+    columns = {
+        row[0].lower(): (row[0], row[1].lower(), row[2] == "YES")
+        for row in cursor.fetchall()
+    }
+    if not columns:
+        raise ValueError(f"Tabela {schema}.{table_name} não existe no banco de destino")
+
+    cursor.execute(
+        "SELECT kcu.COLUMN_NAME "
+        "FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc "
+        "JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu "
+        "  ON kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME "
+        " AND kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA "
+        " AND kcu.TABLE_NAME = tc.TABLE_NAME "
+        "WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' "
+        "  AND tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ? "
+        "ORDER BY kcu.ORDINAL_POSITION",
+        schema,
+        table_name,
+    )
+    pk_cols = [row[0] for row in cursor.fetchall()]
+
+    cursor.execute(
+        "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID(?) AND is_identity = 1",
+        f"{schema}.{table_name}",
+    )
+    identity_cols = [row[0] for row in cursor.fetchall()]
+
+    return columns, pk_cols, identity_cols
 
 
-def _odbc_value(value: str) -> str:
-    """Escapa um valor para uso em uma string de conexão ODBC."""
-    return "{" + value.replace("}", "}}") + "}"
+def _convert(value: str, data_type: str, nullable: bool):
+    if value == "":
+        return None if nullable else value
+    if data_type in ("datetime", "datetime2", "smalldatetime"):
+        return datetime.fromisoformat(value)
+    if data_type == "date":
+        return date.fromisoformat(value[:10])
+    if data_type == "time":
+        return time.fromisoformat(value)
+    if data_type == "bit":
+        return value.strip().lower() in ("1", "true")
+    return value
 
 
-def _nome_tabela_qualificado(schema: str, tabela: str) -> str:
-    """Protege identificadores SQL Server."""
-    schema_escapado = schema.replace("]", "]]")
-    tabela_escapada = tabela.replace("]", "]]")
-    return f"[{schema_escapado}].[{tabela_escapada}]"
+def load_datalake_to_sql(
+    schema: str, table_name: str, run_date: date | None = None
+) -> int:
+    datalake_conn_str = os.getenv("DATALAKE_CONNECTION_STRING")
+    user_sql = os.getenv("DEST_USER") or os.getenv("USER")
+    database_sql = os.getenv("DEST_DATABASE") or os.getenv("DATABASE")
+    host_sql = os.getenv("DEST_HOST") or os.getenv("HOST")
+    password_sql = (os.getenv("DEST_PASSWORD") or os.getenv("PASSWORD") or "").replace(
+        "}", "}}"
+    )
 
-
-def _nome_coluna_qualificado(coluna: str) -> str:
-    """Protege nomes de colunas no SQL Server."""
-    return f"[{coluna.replace(']', ']]')}]"
-
-
-def _obter_string_conexao_sql() -> str:
-    host_sql = os.getenv("HOST")
-    database_sql = os.getenv("DATABASE")
-    user_sql = os.getenv("USER")
-    password_sql = os.getenv("PASSWORD")
-
-    if not all((host_sql, database_sql, user_sql, password_sql)):
+    if not all([datalake_conn_str, user_sql, database_sql, host_sql, password_sql]):
         raise RuntimeError(
-            "Uma ou mais variáveis de conexão com o banco (HOST, DATABASE, USER, PASSWORD) estão ausentes."
+            "Variáveis de ambiente ausentes (DATALAKE_CONNECTION_STRING, USER, DATABASE, HOST, PASSWORD)"
         )
 
-    return (
+    sql_conn_str = (
         "DRIVER={ODBC Driver 18 for SQL Server};"
-        f"SERVER={_odbc_value(host_sql)};"
-        f"DATABASE={_odbc_value(database_sql)};"
-        f"UID={_odbc_value(user_sql)};"
-        f"PWD={_odbc_value(password_sql)};"
+        f"SERVER={host_sql};"
+        f"DATABASE={database_sql};"
+        f"UID={user_sql};"
+        f"PWD={{{password_sql}}};"
         "Encrypt=yes;"
         "TrustServerCertificate=no;"
         "Connection Timeout=30;"
     )
 
-
-def _listar_ultimos_blobs_por_entidade(
-    container_client: ContainerClient, fonte: str
-) -> dict[str, str]:
-    """
-    Percorre a pasta da fonte (ex: 'itsm/') no container bronze e retorna
-    o caminho do arquivo .json mais recente de cada subpasta (entidade).
-    """
-    prefixo = f"{fonte.rstrip('/')}/"
-    ultimos_blobs: dict[str, tuple[datetime, str]] = {}
-
-    for blob in container_client.list_blobs(name_starts_with=prefixo):
-        if not blob.name.endswith(".json"):
-            continue
-
-        partes = blob.name.split("/")
-        if len(partes) < 2:
-            continue
-
-        entidade = partes[1]
-        data_modificacao = blob.last_modified or datetime.min
-
-        if (
-            entidade not in ultimos_blobs
-            or data_modificacao >= ultimos_blobs[entidade][0]
-        ):
-            ultimos_blobs[entidade] = (data_modificacao, blob.name)
-
-    return {entidade: caminho for entidade, (_, caminho) in ultimos_blobs.items()}
-
-
-def _inferir_tipo_sql(valores: list[Any]) -> str:
-    """Infere o tipo de dado no SQL Server caso a tabela precise ser criada."""
-    nao_nulos = [v for v in valores if v is not None]
-    if not nao_nulos:
-        return "NVARCHAR(4000) NULL"
-
-    if all(isinstance(v, bool) for v in nao_nulos):
-        return "BIT NULL"
-    if all(isinstance(v, int) and not isinstance(v, bool) for v in nao_nulos):
-        return "BIGINT NULL"
-    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in nao_nulos):
-        return "FLOAT NULL"
-
-    maior_texto = max((len(str(v)) for v in nao_nulos), default=0)
-    if maior_texto > 4000:
-        return "NVARCHAR(MAX) NULL"
-    return "NVARCHAR(4000) NULL"
-
-
-def _garantir_tabela_existe(
-    cursor: pyodbc.Cursor, schema: str, tabela: str, registros: list[dict[str, Any]]
-) -> None:
-    """Cria a tabela automaticamente no banco caso ela ainda não exista."""
-    cursor.execute(
-        """
-        SELECT 1
-        FROM sys.tables AS t
-        INNER JOIN sys.schemas AS s ON s.schema_id = t.schema_id
-        WHERE s.name = ? AND t.name = ?
-        """,
-        (schema, tabela),
-    )
-    if cursor.fetchone():
-        return
-
-    colunas = list(registros[0].keys())
-    definicoes_colunas = []
-    for col in colunas:
-        amostra = [linha.get(col) for linha in registros]
-        tipo_sql = _inferir_tipo_sql(amostra)
-        definicoes_colunas.append(f"{_nome_coluna_qualificado(col)} {tipo_sql}")
-
-    nome_qualificado = _nome_tabela_qualificado(schema, tabela)
-    sql_create = f"CREATE TABLE {nome_qualificado} ({', '.join(definicoes_colunas)})"
-    cursor.execute(sql_create)
-    logger.info("Tabela %s criada automaticamente.", nome_qualificado)
-
-
-def _possui_coluna_identity(cursor: pyodbc.Cursor, schema: str, tabela: str) -> bool:
-    """Verifica se a tabela possui coluna IDENTITY para liberar a inserção de IDs."""
-    cursor.execute(
-        """
-        SELECT COUNT(1)
-        FROM sys.identity_columns AS ic
-        INNER JOIN sys.tables AS t ON t.object_id = ic.object_id
-        INNER JOIN sys.schemas AS s ON s.schema_id = t.schema_id
-        WHERE s.name = ? AND t.name = ?
-        """,
-        (schema, tabela),
-    )
-    resultado = cursor.fetchone()
-    return bool(resultado and resultado[0] > 0)
-
-
-def carregar_dados_na_tabela(
-    cursor: pyodbc.Cursor,
-    entidade: str,
-    registros: list[dict[str, Any]],
-) -> None:
-    """Garante a existência da tabela, limpa dados antigos e insere os registros."""
-    if not registros:
-        logger.info("Nenhum registro para carregar na entidade '%s'.", entidade)
-        return
-
-    if "." in entidade:
-        schema, tabela = entidade.split(".", 1)
-    else:
-        schema, tabela = "dbo", entidade
-
-    nome_qualificado = _nome_tabela_qualificado(schema, tabela)
-    _garantir_tabela_existe(cursor, schema, tabela, registros)
-
-    colunas = list(registros[0].keys())
-    colunas_sql = ", ".join(_nome_coluna_qualificado(c) for c in colunas)
-    placeholders = ", ".join("?" for _ in colunas)
-
-    # Limpa os dados anteriores da tabela para evitar duplicidade
-    cursor.execute(f"DELETE FROM {nome_qualificado}")
-
-    tem_identity = _possui_coluna_identity(cursor, schema, tabela)
-    if tem_identity:
-        cursor.execute(f"SET IDENTITY_INSERT {nome_qualificado} ON")
-
+    conn = None
     try:
-        sql_insert = (
-            f"INSERT INTO {nome_qualificado} ({colunas_sql}) VALUES ({placeholders})"
-        )
-        cursor.fast_executemany = True
+        # Achar o CSV mais recente da pasta do dia (UTC, igual ao extract)
+        run_date = run_date or datetime.now(UTC).date()
+        folder_path = f"{schema}/{table_name}/{run_date:%Y/%m/%d}"
 
-        # Prepara as linhas convertendo eventuais dicts/listas aninhados em string JSON
-        linhas = [
-            tuple(
-                json.dumps(linha.get(c), ensure_ascii=False)
-                if isinstance(linha.get(c), (dict, list))
-                else linha.get(c)
-                for c in colunas
+        datalake = DataLakeServiceClient.from_connection_string(datalake_conn_str)
+        file_system_client = datalake.get_file_system_client("bronze")
+
+        try:
+            file_paths = [
+                p.name
+                for p in file_system_client.get_paths(path=folder_path, recursive=False)
+                if not p.is_directory and p.name.lower().endswith(".csv")
+            ]
+        except ResourceNotFoundError:
+            file_paths = []
+
+        if not file_paths:
+            logger.info(f"Nenhum arquivo CSV encontrado em bronze/{folder_path}")
+            return 0
+
+        latest_file_path = max(file_paths)  # nome tem timestamp => max = mais novo
+        logger.info(f"Iniciando leitura do arquivo: {latest_file_path}")
+
+        file_client = file_system_client.get_file_client(latest_file_path)
+        csv_string = file_client.download_file().readall().decode("utf-8-sig")
+
+        csv_reader = csv.reader(io.StringIO(csv_string, newline=""))
+        columns = next(csv_reader, None)
+        rows = [row for row in csv_reader if row]
+
+        if not columns or not rows:
+            logger.info("O arquivo CSV está vazio (apenas cabeçalho).")
+            return 0
+
+        if any(len(row) != len(columns) for row in rows):
+            raise ValueError(
+                f"{latest_file_path}: há linhas com número de colunas diferente do cabeçalho"
             )
-            for linha in registros
+
+        target = f"[{schema}].[{table_name}]"
+        conn = pyodbc.connect(sql_conn_str)
+        cursor = conn.cursor()
+
+        meta, pk_cols, identity_cols = _table_metadata(cursor, schema, table_name)
+
+        missing = [c for c in columns if c.lower() not in meta]
+        if missing:
+            raise ValueError(
+                f"Colunas do CSV que não existem em {schema}.{table_name}: {missing}"
+            )
+
+        col_defs = [meta[c.lower()] for c in columns]
+        real_cols = [d[0] for d in col_defs]
+        data = [
+            tuple(_convert(v, d[1], d[2]) for v, d in zip(row, col_defs, strict=True))
+            for row in rows
         ]
 
-        tamanho_lote = 1000
-        for i in range(0, len(linhas), tamanho_lote):
-            cursor.executemany(sql_insert, linhas[i : i + tamanho_lote])
+        quoted = ", ".join(f"[{c}]" for c in real_cols)
+        placeholders = ", ".join(["?"] * len(real_cols))
+        identity_lower = {c.lower() for c in identity_cols}
+        pk_lower = {c.lower() for c in pk_cols}
+        has_identity = any(c.lower() in identity_lower for c in real_cols)
+
+        # Carrega o CSV numa tabela temporária com a estrutura do destino
+        cursor.execute(f"SELECT {quoted} INTO #stage FROM {target} WHERE 1 = 0")
+        if has_identity:
+            cursor.execute("SET IDENTITY_INSERT #stage ON")
+        cursor.executemany(
+            f"INSERT INTO #stage ({quoted}) VALUES ({placeholders})", data
+        )
+        if has_identity:
+            cursor.execute("SET IDENTITY_INSERT #stage OFF")
+
+        if has_identity:
+            cursor.execute(f"SET IDENTITY_INSERT {target} ON")
+
+        if pk_cols:
+            if not pk_lower.issubset({c.lower() for c in real_cols}):
+                raise ValueError(
+                    f"CSV não contém todas as colunas da PK de {schema}.{table_name}: {pk_cols}"
+                )
+            on_clause = " AND ".join(f"t.[{k}] = s.[{k}]" for k in pk_cols)
+            update_cols = [
+                c
+                for c in real_cols
+                if c.lower() not in pk_lower and c.lower() not in identity_lower
+            ]
+            merge_sql = f"MERGE {target} AS t USING #stage AS s ON {on_clause} "
+            if update_cols:
+                set_clause = ", ".join(f"t.[{c}] = s.[{c}]" for c in update_cols)
+                merge_sql += f"WHEN MATCHED THEN UPDATE SET {set_clause} "
+            insert_vals = ", ".join(f"s.[{c}]" for c in real_cols)
+            merge_sql += (
+                f"WHEN NOT MATCHED BY TARGET THEN INSERT ({quoted}) "
+                f"VALUES ({insert_vals});"
+            )
+            cursor.execute(merge_sql)
+        else:
+            logger.warning(
+                f"{schema}.{table_name} não tem PK: usando INSERT simples (pode duplicar)"
+            )
+            cursor.execute(
+                f"INSERT INTO {target} ({quoted}) SELECT {quoted} FROM #stage"
+            )
+
+        if has_identity:
+            cursor.execute(f"SET IDENTITY_INSERT {target} OFF")
+
+        conn.commit()
 
         logger.info(
-            "Tabela %s carregada com sucesso (%s linhas).",
-            nome_qualificado,
-            len(linhas),
+            f"{len(rows)} linhas processadas com sucesso na tabela {schema}.{table_name}!"
         )
+        return len(rows)
+
+    except Exception as e:
+        if conn is not None:
+            conn.rollback()
+        logger.error(
+            f"Erro ao carregar dados do Data Lake para a tabela {schema}.{table_name}: {e!s}"
+        )
+        raise
     finally:
-        if tem_identity:
-            cursor.execute(f"SET IDENTITY_INSERT {nome_qualificado} OFF")
+        if conn is not None:
+            conn.close()
 
 
-def importar_todas_as_tabelas_da_bronze() -> None:
-    """Puxa os arquivos JSON mais recentes de bronze/itsm e carrega no banco SQL."""
-    conn_str_storage = os.getenv("DEPLOYMENT_STORAGE_CONNECTION_STRING")
-    if not conn_str_storage:
-        raise RuntimeError(
-            "A variável DEPLOYMENT_STORAGE_CONNECTION_STRING não está configurada."
+def extract_table_to_datalake(schema: str, table_name: str) -> None:
+    user_sql = os.getenv("USER")
+    database_sql = os.getenv("DATABASE")
+    host_sql = os.getenv("HOST")
+    password_sql = os.getenv("PASSWORD")
+
+    conn_str = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={host_sql};"
+        f"DATABASE={database_sql};"
+        f"UID={user_sql};"
+        f"PWD={{{password_sql}}};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+        "Connection Timeout=30;"
+    )
+
+    try:
+        with pyodbc.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            query = f"SELECT * FROM {schema}.{table_name}"
+            cursor.execute(query)
+
+            rows = cursor.fetchall()
+            columns = [col[0] for col in cursor.description]
+
+            logger.info(f"{len(rows)} linhas lidas de {schema}.{table_name}")
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(columns)
+        writer.writerows(rows)
+
+        now = datetime.now(UTC)
+        file_path = (
+            f"{schema}/{table_name}/{now:%Y/%m/%d}/{table_name}_{now:%Y%m%d_%H%M%S}.csv"
         )
 
-    # Por padrão busca da pasta 'itsm' caso SOURCE_NAME não esteja definida
-    fonte = (os.getenv("SOURCE_NAME") or "itsm").strip().lower()
-
-    blob_service_client = BlobServiceClient.from_connection_string(conn_str_storage)
-    container_client = blob_service_client.get_container_client("bronze")
-
-    mapa_blobs = _listar_ultimos_blobs_por_entidade(container_client, fonte)
-    if not mapa_blobs:
-        logger.warning(
-            "Nenhum arquivo .json encontrado no container 'bronze/%s'.", fonte
+        datalake = DataLakeServiceClient.from_connection_string(
+            os.getenv("DATALAKE_CONNECTION_STRING")
         )
-        return
-
-    # Ordena as entidades para carregar tabelas pai antes das tabelas filhas
-    entidades_ordenadas = [e for e in ORDEM_ENTIDADES if e in mapa_blobs] + [
-        e for e in sorted(mapa_blobs.keys()) if e not in ORDEM_ENTIDADES
-    ]
-
-    tabelas_com_erro = []
-
-    with pyodbc.connect(_obter_string_conexao_sql()) as conn:
-        cursor = conn.cursor()
-        try:
-            for entidade in entidades_ordenadas:
-                blob_path = mapa_blobs[entidade]
-                logger.info("Baixando blob '%s' para a tabela '%s'...", blob_path, entidade)
-
-                try:
-                    blob_client = container_client.get_blob_client(blob_path)
-                    conteudo = blob_client.download_blob().readall()
-                    registros = json.loads(conteudo.decode("utf-8"))
-
-                    carregar_dados_na_tabela(cursor, entidade, registros)
-                    conn.commit()
-                except Exception:
-                    conn.rollback()
-                    tabelas_com_erro.append(entidade)
-                    logger.exception(
-                        "Erro ao carregar a entidade '%s' a partir de '%s'.",
-                        entidade,
-                        blob_path,
-                    )
-        finally:
-            cursor.close()
-
-    if tabelas_com_erro:
-        raise RuntimeError(
-            "Falha ao importar as seguintes tabelas: " + ", ".join(tabelas_com_erro)
+        file_client = datalake.get_file_system_client("bronze").get_file_client(
+            file_path
         )
+
+        file_client.upload_data(buffer.getvalue().encode("utf-8"), overwrite=True)
+        logger.info(f"Arquivo gravado em bronze/{file_path}")
+
+    except Exception as e:
+        logger.error(f"Erro ao processar a tabela {schema}.{table_name}: {e!s}")
+        raise
+
+
+SCHEDULE_TIME = "0 30 22 * * *"
 
 
 @app.timer_trigger(
-    schedule="0 30 23 * * *", arg_name="myTimer", run_on_startup=False, use_monitor=False
+    schedule=SCHEDULE_TIME, arg_name="myTimer", run_on_startup=False, use_monitor=False
 )
-def load_bronze_to_sql(myTimer: func.TimerRequest) -> None:
-    importar_todas_as_tabelas_da_bronze()
+def extract_chamado(myTimer: func.TimerRequest) -> None:
+    extract_table_to_datalake("itsm", "chamado")
+
+
+@app.timer_trigger(
+    schedule=SCHEDULE_TIME, arg_name="myTimer", run_on_startup=False, use_monitor=False
+)
+def extract_chamado_sla(myTimer: func.TimerRequest) -> None:
+    extract_table_to_datalake("itsm", "chamado_sla")
+
+
+@app.timer_trigger(
+    schedule=SCHEDULE_TIME, arg_name="myTimer", run_on_startup=False, use_monitor=False
+)
+def extract_chamado_status_historico(myTimer: func.TimerRequest) -> None:
+    extract_table_to_datalake("itsm", "chamado_status_historico")
+
+
+@app.timer_trigger(
+    schedule=SCHEDULE_TIME, arg_name="myTimer", run_on_startup=False, use_monitor=False
+)
+def extract_cliente_organizacao(myTimer: func.TimerRequest) -> None:
+    extract_table_to_datalake("itsm", "cliente_organizacao")
+
+
+@app.timer_trigger(
+    schedule=SCHEDULE_TIME, arg_name="myTimer", run_on_startup=False, use_monitor=False
+)
+def extract_analista(myTimer: func.TimerRequest) -> None:
+    extract_table_to_datalake("itsm", "analista")
+
+
+@app.timer_trigger(
+    schedule=SCHEDULE_TIME, arg_name="myTimer", run_on_startup=False, use_monitor=False
+)
+def extract_categoria(myTimer: func.TimerRequest) -> None:
+    extract_table_to_datalake("itsm", "categoria")
+
+
+@app.timer_trigger(
+    schedule=SCHEDULE_TIME, arg_name="myTimer", run_on_startup=False, use_monitor=False
+)
+def extract_csat(myTimer: func.TimerRequest) -> None:
+    extract_table_to_datalake("itsm", "csat")
+
+
+@app.timer_trigger(
+    schedule=SCHEDULE_TIME, arg_name="myTimer", run_on_startup=False, use_monitor=False
+)
+def extract_csat_avaliacao(myTimer: func.TimerRequest) -> None:
+    extract_table_to_datalake("itsm", "csat_avaliacao")
+
+
+@app.timer_trigger(
+    schedule=SCHEDULE_TIME, arg_name="myTimer", run_on_startup=False, use_monitor=False
+)
+def extract_fila(myTimer: func.TimerRequest) -> None:
+    extract_table_to_datalake("itsm", "fila")
+
+
+@app.timer_trigger(
+    schedule=SCHEDULE_TIME, arg_name="myTimer", run_on_startup=False, use_monitor=False
+)
+def extract_sla(myTimer: func.TimerRequest) -> None:
+    extract_table_to_datalake("itsm", "sla")
+
+
+@app.timer_trigger(
+    schedule=SCHEDULE_TIME, arg_name="myTimer", run_on_startup=False, use_monitor=False
+)
+def extract_solicitante(myTimer: func.TimerRequest) -> None:
+    extract_table_to_datalake("itsm", "solicitante")
+
+
+@app.timer_trigger(
+    schedule="0 35 22 * * *",
+    arg_name="myTimer",
+    run_on_startup=False,
+    use_monitor=False,
+)
+def load_all_bronze_to_sql(myTimer: func.TimerRequest) -> None:
+    # Pais antes dos filhos (respeita as FKs)
+    tabelas_ordenadas = [
+        "categoria",
+        "cliente_organizacao",
+        "fila",
+        "sla",
+        "analista",
+        "solicitante",
+        "chamado",
+        "chamado_sla",
+        "chamado_status_historico",
+        "csat",
+        "csat_avaliacao",
+    ]
+
+    logger.info(
+        "A iniciar o carregamento em massa do Data Lake para o SQL (somente arquivos de hoje)..."
+    )
+
+    falhas: dict[str, str] = {}
+
+    for tabela in tabelas_ordenadas:
+        try:
+            logger.info(f"A processar tabela: itsm.{tabela}")
+            load_datalake_to_sql("itsm", tabela)
+
+        except (pyodbc.Error, AzureError, ValueError, RuntimeError, csv.Error) as e:
+            falhas[tabela] = str(e)
+            logger.error(f"Falha ao carregar a tabela itsm.{tabela}: {e!s}")
+
+    logger.info("Carregamento em massa concluído!")
+
+    if falhas:
+        # Faz a execução aparecer como falha no monitoramento do Azure
+        raise RuntimeError(f"Falha em {len(falhas)} tabela(s): {falhas}")
